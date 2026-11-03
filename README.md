@@ -1,4 +1,5 @@
 # cet245-setup
+<<<<<<< HEAD
 Catch-up and repair scripts for CET 245 Internet Servers. They bring the Ubuntu Server
 and Ubuntu Client lab VMs to the end state of any lab from 2 through 10, and fix a VM
 whose earlier labs were done wrong.
@@ -62,3 +63,8 @@ Log: `/var/log/cet245-setup.log`
 
 These are instructor tools: the scripts do the configuration, not the learning.
 Students still owe every screenshot and written answer.
+=======
+Auto setup scripts and guides for CET-245 Internet Servers
+
+	Read the guide for info on how to get started
+>>>>>>> 372192a5c0981ccdebbdcd9c031389ccdc2a0f8d
