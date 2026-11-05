@@ -1,5 +1,4 @@
 # cet245-setup
-<<<<<<< HEAD
 Catch-up and repair scripts for CET 245 Internet Servers. They bring the Ubuntu Server
 and Ubuntu Client lab VMs to the end state of any lab from 2 through 10, and fix a VM
 whose earlier labs were done wrong.
@@ -9,7 +8,8 @@ whose earlier labs were done wrong.
 | `cet245_server_setup.sh` | Ubuntu Server, as root | Labs 2-10 |
 | `cet245_client_setup.sh` | Ubuntu Client (Desktop), with sudo | client side of Labs 2-10 |
 
-Run the server script first, then the client script.
+Run the server script first, then the client script. Read the guide
+(`CET245_Environment_Setup_Guide_Labs1-5.docx`) for how to get started.
 
 ## Server
 ```
@@ -48,6 +48,14 @@ IdentityFile, the key copied to the server, `for-transfer.txt` copied into
 `~/Downloads`, lynx, and an HTTPS check.
 
 ## How repairs work
+- Before installing anything, both scripts disable a leftover installer (cdrom) package
+  source, check internet by IP and **name resolution** (the lookup `ping` and `apt` use),
+  and repair `/etc/resolv.conf` / systemd-resolved if names fail. As a last resort they add
+  a temporary DNS server so the installs can run.
+- The client checks that the server's BIND answers both `classroom.edu` and internet
+  names. If it only answers `classroom.edu`, 1.1.1.1 is added as a temporary second DNS
+  server; `--check` warns while it is still there. `--check` on either VM prints a name
+  resolution report (each DNS server, and whether public DNS is reachable) when names fail.
 - Each step checks the current state first; re-running is safe.
 - Files the script replaces are copied to `/var/backups/cet245/<date-time>/` first.
 - Student-written content (`index.html`, `info.php`, `for-transfer.txt`) is created
@@ -63,8 +71,3 @@ Log: `/var/log/cet245-setup.log`
 
 These are instructor tools: the scripts do the configuration, not the learning.
 Students still owe every screenshot and written answer.
-=======
-Auto setup scripts and guides for CET-245 Internet Servers
-
-	Read the guide for info on how to get started
->>>>>>> 372192a5c0981ccdebbdcd9c031389ccdc2a0f8d

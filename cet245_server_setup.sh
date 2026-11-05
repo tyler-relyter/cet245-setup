@@ -28,7 +28,9 @@
 #  Safe to re-run: each step checks before it changes anything. Any file it
 #  replaces is copied to /var/backups/cet245/<date-time>/ first, and files a
 #  student writes by hand (index.html, info.php, for-transfer.txt) are only
-#  created when missing, never overwritten.
+#  created when missing, never overwritten. Before installing anything it
+#  disables a leftover installer (cdrom) package source and checks that names
+#  resolve, repairing /etc/resolv.conf or adding a temporary DNS server if not.
 #  Log: /var/log/cet245-setup.log
 # =============================================================================
 set -Eeuo pipefail
@@ -64,7 +66,7 @@ BACKUP_DIR="/var/backups/cet245/$(date +%Y%m%d-%H%M%S)"
 LABS=$(seq -s, 2 "$LAST_LAB")
 CHECK_ONLY=0
 
-usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --through) LABS=$(seq -s, 2 "$2"); shift 2 ;;
@@ -156,6 +158,136 @@ time_service() {
   done
 }
 
+FALLBACK_DNS=("${UPSTREAM_DNS[@]:0:2}")   # temporary DNS if names fail before Lab 5
+# ===================== preflight: package sources and DNS ====================
+# Both VMs need working name resolution before apt can install anything, and a
+# VM that pings 8.8.8.8 but can't resolve names fails every later lab. These
+# helpers find out where resolution breaks and repair what they safely can.
+INET_TEST_NAME="archive.ubuntu.com"     # a name apt needs anyway
+
+# names_ok [NAME] : resolves through the system resolver, the way ping and apt do
+names_ok() { getent ahostsv4 "${1:-$INET_TEST_NAME}" >/dev/null 2>&1; }
+
+# resolv_ok : /etc/resolv.conf is systemd-resolved's file (Ubuntu's default)
+resolv_ok() {
+  local t; t=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+  [[ "$t" == /run/systemd/resolve/stub-resolv.conf || "$t" == /run/systemd/resolve/resolv.conf ]]
+}
+
+# dns_servers : the DNS servers systemd-resolved is using, one per line
+dns_servers() {
+  resolvectl dns 2>/dev/null | sed 's/^[^:]*://' | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' | sort -u || true
+}
+
+# dns_report : explain where name resolution breaks, one line per DNS server
+dns_report() {
+  local s n=0
+  say "Name resolution report"
+  if resolv_ok; then ok "/etc/resolv.conf -> $(readlink -f /etc/resolv.conf)"
+  else warn "/etc/resolv.conf is not systemd-resolved's file ($(readlink -f /etc/resolv.conf 2>/dev/null || echo missing))"; fi
+  systemctl is-active --quiet systemd-resolved && ok "systemd-resolved running" || warn "systemd-resolved is not running"
+  for s in $(dns_servers); do
+    n=$((n + 1))
+    if ! command -v dig >/dev/null; then ok "DNS server in use: $s"; continue; fi
+    if dig +short +time=2 +tries=1 @"$s" "$INET_TEST_NAME" 2>/dev/null | grep -qE '^[0-9.]+$'; then
+      ok "DNS server $s answers internet names"
+    else
+      warn "DNS server $s does NOT answer internet names ($INET_TEST_NAME)"
+    fi
+  done
+  [[ $n -gt 0 ]] || warn "no DNS servers configured (resolvectl dns lists none)"
+  if command -v dig >/dev/null; then
+    if dig +short +time=2 +tries=1 @1.1.1.1 "$INET_TEST_NAME" 2>/dev/null | grep -qE '^[0-9.]+$'; then
+      ok "public DNS 1.1.1.1 reachable - the problem is the DNS server(s) above, not the network"
+    else
+      warn "public DNS 1.1.1.1 not reachable either - outbound DNS (port 53) is blocked or there is no internet"
+    fi
+  fi
+}
+
+# fix_resolver : make sure systemd-resolved runs and /etc/resolv.conf points at it
+# (students sometimes edit or replace /etc/resolv.conf, or link it to a typo).
+fix_resolver() {
+  if [[ ! -e /usr/lib/systemd/system/systemd-resolved.service && ! -e /lib/systemd/system/systemd-resolved.service ]]; then
+    warn "systemd-resolved is not installed - leaving /etc/resolv.conf alone"; return 0
+  fi
+  if ! systemctl is-active --quiet systemd-resolved; then
+    systemctl enable --now systemd-resolved >>"$LOG" 2>&1 && ok "systemd-resolved started"
+  fi
+  if ! resolv_ok; then
+    if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then backup /etc/resolv.conf; fi
+    ln -sfn ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+    ok "/etc/resolv.conf linked back to systemd-resolved (old copy in $BACKUP_DIR)"
+  fi
+  resolvectl flush-caches >/dev/null 2>&1 || true
+}
+
+# disable_cdrom_sources : the installer ISO is left as a package source
+# ("file:/cdrom ... no longer has a Release file"), which makes apt update fail.
+disable_cdrom_sources() {
+  local f changed=0 tmp
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+    [[ -f "$f" ]] || continue
+    grep -qE '^[[:space:]]*deb(-src)?[[:space:]].*(cdrom:|file:/+cdrom)' "$f" || continue
+    backup "$f"
+    sed -i -E 's/^([[:space:]]*deb(-src)?[[:space:]].*(cdrom:|file:\/+cdrom).*)$/# \1/' "$f"
+    ok "disabled the installer cdrom source in $f"; changed=1
+  done
+  for f in /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    grep -qiE '^URIs:.*(cdrom:|file:/+cdrom)' "$f" || continue
+    tmp=$(mktemp)
+    # deb822 format: add "Enabled: no" to each stanza whose URIs point at the cdrom.
+    awk '
+      function flush(   i) {
+        for (i = 1; i <= n; i++) if (!(cd && tolower(L[i]) ~ /^enabled:/)) print L[i]
+        if (cd) print "Enabled: no"
+        n = 0; cd = 0
+      }
+      /^[ \t]*$/ { flush(); print; next }
+      { L[++n] = $0; if (tolower($0) ~ /^uris:/ && ($0 ~ /cdrom:/ || $0 ~ /file:\/+cdrom/)) cd = 1 }
+      END { flush() }' "$f" > "$tmp"
+    if cmp -s "$tmp" "$f"; then rm -f "$tmp"; continue; fi   # already disabled
+    backup "$f"
+    cat "$tmp" > "$f"; rm -f "$tmp"
+    ok "disabled the installer cdrom source in $f"; changed=1
+  done
+  [[ $changed -eq 1 ]] || ok "package sources OK (no installer cdrom entry)"
+}
+
+# apt_update : apt-get update that shows apt's own error lines if it fails
+apt_update() {
+  if apt-get update -q >>"$LOG" 2>&1; then ok "apt-get update"; return 0; fi
+  tail -n 40 "$LOG" | grep -E '^(E|Err):' | sort -u | sed 's/^/        /' || true
+  die "apt-get update failed - the errors above come from apt (full log: $LOG)"
+}
+
+# preflight_network : sources, internet by IP, then names; repair names if needed
+preflight_network() {
+  say "Preflight - package sources, internet, name resolution"
+  disable_cdrom_sources
+  local ip_ok=1
+  if ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1; then ok "internet reachable by IP (ping 8.8.8.8)"
+  else ip_ok=0; warn "cannot ping 8.8.8.8 (some networks block ping; checking names anyway)"; fi
+  if names_ok; then ok "name resolution works (getent $INET_TEST_NAME)"; return 0; fi
+  if [[ $ip_ok -eq 0 ]]; then
+    warn "no ping and no names: the VM probably has no internet - check its network adapter, NAT Network and gateway ($GATEWAY)"
+  else
+    warn "ping by IP works but names do not resolve - repairing DNS"
+  fi
+  fix_resolver
+  if names_ok; then ok "name resolution works after the resolver fix"; return 0; fi
+  dns_report
+  # Last resort so the installs can run: a temporary DNS server on the interface.
+  # It is runtime only (gone after a reboot); the lab steps below set the real DNS.
+  if resolvectl dns "$IFACE" "${FALLBACK_DNS[@]}" >>"$LOG" 2>&1; then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  if names_ok; then ok "temporary DNS ${FALLBACK_DNS[*]} on $IFACE lets installs run (cleared on reboot)"
+  else warn "names still do not resolve, even through ${FALLBACK_DNS[*]} - apt will fail; see the report above"; fi
+}
+
 # ============================== verification =================================
 check() {   # check "description" command...
   local d="$1"; shift
@@ -170,6 +302,11 @@ cron_has() { crontab -u "$1" -l 2>/dev/null | grep -qF -- "$2"; }
 verify() {
   say "Verification"
   local ph sh; ph=$(php_ver); sh=$(student_home)
+  check "internet reachable by IP (ping 8.8.8.8)" ping -c 2 -W 2 8.8.8.8
+  check "internet names resolve - what ping and apt use (getent $INET_TEST_NAME)" names_ok
+  check "/etc/resolv.conf is managed by systemd-resolved" resolv_ok
+  if done_or_wanted 5; then check "lab names resolve (getent server.$DOMAIN)" names_ok "server.$DOMAIN"; fi
+  names_ok || dns_report
   want 2 && { check "hostname is $SERVER_HOSTNAME" test "$(hostname)" = "$SERVER_HOSTNAME"
               check "ssh service active" bash -c "systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket"; }
   want 3 && { check "$IFACE has $SERVER_IP/$PREFIX" bash -c "ip -4 addr show $IFACE | grep -q '$SERVER_IP/$PREFIX'"
@@ -256,7 +393,8 @@ fi
 want 9 && PKGS+=(php-fpm php-pear)
 want 10 && PKGS+=(openssl ssl-cert)
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q >>"$LOG" 2>&1
+preflight_network
+apt_update
 apt-get install -y -q "${PKGS[@]}" >>"$LOG" 2>&1
 ok "installed: ${PKGS[*]}"
 if want 7; then
@@ -536,6 +674,28 @@ EOF
   systemctl restart systemd-resolved
   resolvectl flush-caches 2>/dev/null || true
   ok "resolved.conf: DNS=127.0.0.1"
+  sleep 1
+  bind_answers() { dig +short +time=3 +tries=1 @127.0.0.1 "$@" 2>/dev/null | grep -qE '^[0-9.]+$'; }
+  if ! bind_answers "$INET_TEST_NAME"; then
+    systemctl restart named; sleep 2   # one retry: named can start before the network is up
+  fi
+  if bind_answers "$INET_TEST_NAME"; then
+    ok "BIND resolves internet names (recursion through the forwarders works)"
+  elif bind_answers +cd "$INET_TEST_NAME"; then
+    warn "BIND only answers with DNSSEC checking off: the clock is probably wrong ($(date)). Lab 7 installs ntp; or run: timedatectl set-ntp true"
+  elif ! dig +short +time=2 +tries=1 @"${UPSTREAM_DNS[0]}" "$INET_TEST_NAME" 2>/dev/null | grep -q .; then
+    warn "BIND cannot reach its forwarders (${UPSTREAM_DNS[*]:0:2}) - outbound DNS is blocked or there is no internet"
+  else
+    warn "BIND is not answering internet names - see /var/log/named/named.log"
+  fi
+  bind_answers "server.$DOMAIN" && ok "BIND answers server.$DOMAIN" || warn "BIND does not answer server.$DOMAIN"
+  if names_ok && names_ok "server.$DOMAIN"; then
+    ok "the server's own resolver uses BIND: internet and $DOMAIN names resolve"
+  else
+    fix_resolver
+    if names_ok && names_ok "server.$DOMAIN"; then ok "name resolution works after the resolver fix"
+    else warn "the server's resolver still fails - see the report below"; dns_report; fi
+  fi
   mark_done 5
 fi
 
