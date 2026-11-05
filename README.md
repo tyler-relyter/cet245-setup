@@ -27,7 +27,7 @@ Run from the VM console when Lab 3 is included (it changes the IP address).
 
 | Lab | What the server script does |
 |---|---|
-| 2 | hostname, root password, ssh |
+| 2 | hostname, root password, ssh installed, enabled at boot and answering on port 22 |
 | 3 | nftables (trusted 10.0.2.0/24 set), fail2ban, static 10.0.2.5/24 |
 | 4 | instructor/lecturer, faculty, Labs dir 740 + ACL, %faculty sudo |
 | 5 | BIND9 for classroom.edu, forward and reverse zones, resolved.conf |
@@ -45,7 +45,8 @@ sudo bash cet245_client_setup.sh --check
 Static 10.0.2.15/24 with the server as DNS, `/etc/hosts` entry for classroom.edu,
 key pair `~/.ssh/key-student-server`, `~/.ssh/config` Host server with the
 IdentityFile, the key copied to the server, `for-transfer.txt` copied into
-`~/Downloads`, lynx, and an HTTPS check.
+`~/Downloads`, lynx, and an HTTPS check. It also tests the Lab 6 logins: the
+password login (`ssh student@10.0.2.5`), the key login, and `ssh server`.
 
 ## How repairs work
 - Before installing anything, both scripts disable a leftover installer (cdrom) package
@@ -56,6 +57,17 @@ IdentityFile, the key copied to the server, `for-transfer.txt` copied into
   names. If it only answers `classroom.edu`, 1.1.1.1 is added as a temporary second DNS
   server; `--check` warns while it is still there. `--check` on either VM prints a name
   resolution report (each DNS server, and whether public DNS is reachable) when names fail.
+- **SSH (port 22, the port the Lab 3 and Lab 6 firewall rules open).** The server script
+  makes sure openssh-server is installed and `sshd -t` passes (it regenerates missing host
+  keys, comments out unknown options, and only as a last resort restores Ubuntu's default
+  `sshd_config`), resets a changed `Port` back to 22, enables and restarts ssh (and
+  `ssh.socket`, which owns the port on Ubuntu 24.04), then proves the port answers with an
+  SSH banner on 127.0.0.1 and 10.0.2.5. It checks that nftables and UFW allow port 22 and
+  unbans lab addresses fail2ban has banned after wrong passwords. `--labs 6` is the quick
+  SSH repair.
+- The client checks SSH on 10.0.2.5, server.classroom.edu and classroom.edu before the key
+  steps. When the port fails it says why: connection refused (sshd not running), no answer
+  (a firewall dropping it, or a fail2ban ban), or the name doesn't resolve.
 - Each step checks the current state first; re-running is safe.
 - Files the script replaces are copied to `/var/backups/cet245/<date-time>/` first.
 - Student-written content (`index.html`, `info.php`, `for-transfer.txt`) is created

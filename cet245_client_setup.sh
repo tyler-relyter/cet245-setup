@@ -40,6 +40,7 @@ GATEWAY="auto"      # "auto" = keep the gateway DHCP gave this VM. Lab 3 says 10
 TEMP_DNS="1.1.1.1"  # only used if the server's DNS isn't answering yet
 IFACE="auto"
 KEY_NAME="key-student-server"  # Lab 6 step 9
+SSH_PORT="22"                  # SSH port on the server (and this VM) - Labs 2/3/6 use 22
 # -----------------------------------------------------------------------------
 
 LOG=/var/log/cet245-setup.log
@@ -64,7 +65,7 @@ BACKUP_DIR="/var/backups/cet245/$(date +%Y%m%d-%H%M%S)"
 backup() {   # copy a file into this run's backup folder before it is changed
   [[ -e "$1" || -L "$1" ]] || return 0
   mkdir -p "$BACKUP_DIR$(dirname "$1")"
-  cp -aP "$1" "$BACKUP_DIR$1"
+  [[ -e "$BACKUP_DIR$1" || -L "$BACKUP_DIR$1" ]] || cp -aP "$1" "$BACKUP_DIR$1"   # keep the copy from before this run
 }
 
 [[ $EUID -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
@@ -89,7 +90,54 @@ fi
 DHOME=$(getent passwd "$DUSER" | cut -d: -f6 || true)
 KEY="$DHOME/.ssh/$KEY_NAME"
 as_user() { sudo -u "$DUSER" -H "$@"; }
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -p "$SSH_PORT")
+
+# ---------------------------------- SSH ---------------------------------------
+# ssh_banner HOST : HOST's SSH port answers the way an SSH server does ("SSH-2.0-...")
+ssh_banner() {
+  timeout 6 bash -c 'exec 3<>"/dev/tcp/$1/$2" && IFS= read -r -t 5 l <&3 && [[ $l == SSH-2.0-* ]]' \
+    _ "$1" "$SSH_PORT" 2>/dev/null
+}
+# ssh_port_state HOST : open | refused | filtered (no answer: a firewall dropping it)
+ssh_port_state() {
+  local rc=0
+  timeout 4 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$1" "$SSH_PORT" 2>/dev/null || rc=$?
+  case $rc in 0) echo open ;; 124) echo filtered ;; *) echo refused ;; esac
+}
+# ssh_server_reachable : the server answers SSH by IP and by both lab names;
+# if not, say why, so the student knows which lab to fix.
+ssh_server_reachable() {
+  local h bad=0 st
+  for h in "$SERVER_IP" "$SERVER_FQDN" "$DOMAIN"; do
+    if ssh_banner "$h"; then ok "SSH answers on $h:$SSH_PORT"; continue; fi
+    bad=1
+    if [[ "$h" != "$SERVER_IP" ]] && ! getent ahostsv4 "$h" >/dev/null 2>&1; then
+      warn "$h does not resolve - check the /etc/hosts line (Lab 6 step 5) and the server's DNS (Lab 5)"; continue
+    fi
+    st=$(ssh_port_state "$h")
+    case $st in
+      refused)  warn "$h:$SSH_PORT refused the connection - sshd is not running on the server (Lab 2: systemctl enable --now ssh)" ;;
+      filtered) warn "$h:$SSH_PORT does not answer - a firewall on the server is dropping it (Lab 3 nftables 'tcp dport $SSH_PORT accept', Lab 6 'ufw allow ssh'), or fail2ban banned $CLIENT_IP after wrong passwords" ;;
+      open)     warn "$h:$SSH_PORT is open but did not send an SSH banner - something other than sshd is on that port" ;;
+    esac
+  done
+  if [[ $bad -eq 1 ]]; then
+    ping -c 1 -W 2 "$SERVER_IP" >/dev/null 2>&1 || warn "the server does not answer ping either - is the server VM on, at $SERVER_IP, on the same NAT network?"
+    warn "to repair sshd, the firewalls and fail2ban, run on the server: sudo bash cet245_server_setup.sh --labs 6"
+    return 1
+  fi
+}
+# password_login_ok : Lab 6 step 2, "ssh student@10.0.2.5" with the lab password
+password_login_ok() {
+  command -v sshpass >/dev/null || return 2
+  as_user env SSHPASS="$LAB_PASSWORD" sshpass -e ssh -p "$SSH_PORT" -o ConnectTimeout=5 \
+    -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+    "$SERVER_USER@$SERVER_IP" true 2>/dev/null
+}
+# alias_login_ok : Lab 6 step 10, "ssh server" through ~/.ssh/config, with the key
+alias_login_ok() { as_user ssh -o BatchMode=yes -o ConnectTimeout=5 server true 2>/dev/null; }
+# local_ssh_ok : this VM's own sshd (Lab 2 installs ssh on both VMs)
+local_ssh_ok() { ssh_banner 127.0.0.1; }
 
 # hosts_maps NAME... : true if /etc/hosts has a $SERVER_IP line listing every NAME
 hosts_maps() { awk -v ip="$SERVER_IP" -v names="$*" '
@@ -247,7 +295,11 @@ verify() {
   check "ping google.com works" ping -c 2 -W 2 google.com
   check "/etc/resolv.conf is managed by systemd-resolved" resolv_ok
   check "server reachable (ping $SERVER_IP)" ping -c 2 -W 2 "$SERVER_IP"
-  check "server SSH port open" timeout 3 bash -c "</dev/tcp/$SERVER_IP/22"
+  check "ssh server on this VM answers on port $SSH_PORT (Lab 2)" local_ssh_ok
+  check "server answers SSH on $SERVER_IP:$SSH_PORT" ssh_banner "$SERVER_IP"
+  check "server answers SSH on $SERVER_FQDN:$SSH_PORT" ssh_banner "$SERVER_FQDN"
+  check "server answers SSH on $DOMAIN:$SSH_PORT" ssh_banner "$DOMAIN"
+  if ! ssh_banner "$SERVER_IP" || ! ssh_banner "$SERVER_FQDN"; then say "Why SSH to the server fails"; ssh_server_reachable || true; fi
   check "server DNS answers $DOMAIN names (dig @$SERVER_IP $SERVER_FQDN)" server_dns_ok
   check "server DNS answers internet names (dig @$SERVER_IP $INET_TEST_NAME)" server_recursion_ok
   check "system resolver finds $DOMAIN (dig $DOMAIN)" bash -c "dig +short $DOMAIN | grep -qx '$SERVER_IP'"
@@ -256,7 +308,10 @@ verify() {
   check "Lab 6: /etc/hosts maps $DOMAIN to $SERVER_IP" hosts_maps "$DOMAIN"
   check "Lab 6: key pair ~/.ssh/$KEY_NAME exists" test -s "$KEY" -a -s "$KEY.pub"
   check "Lab 6: ~/.ssh/config has Host server with IdentityFile" bash -c "grep -q '^Host server' '$DHOME/.ssh/config' && grep -q 'IdentityFile.*$KEY_NAME' '$DHOME/.ssh/config'"
-  check "Lab 6: key login works (ssh server)" key_login_ok
+  if command -v sshpass >/dev/null; then
+    check "Lab 6: password login works (ssh $SERVER_USER@$SERVER_IP)" password_login_ok; fi
+  check "Lab 6: key login works (ssh -i ~/.ssh/$KEY_NAME)" key_login_ok
+  check "Lab 6: ssh server works (the ~/.ssh/config alias)" alias_login_ok
   check "Lab 6: for-transfer.txt copied to ~/Downloads" test -s "$DHOME/Downloads/for-transfer.txt"
   check "Lab 8: lynx installed" command -v lynx
   check "Lab 8-9: web site answers on http://$DOMAIN" bash -c "curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 5 http://$DOMAIN/ | grep -qE '^(200|301)$'"
@@ -277,6 +332,12 @@ ok "installed: ssh dnsutils lynx curl"
 if apt-cache policy sshpass 2>/dev/null | grep -q 'Candidate: [0-9]'; then
   apt-get install -y -q sshpass >>"$LOG" 2>&1 && ok "installed: sshpass (copies the key without a password prompt)"
 fi
+# Lab 2 step 13 on this VM too: systemctl enable --now ssh
+systemctl daemon-reload
+systemctl enable --now ssh >>"$LOG" 2>&1 || systemctl enable --now ssh.socket >>"$LOG" 2>&1 || true
+for _ in 1 2 3 4 5; do local_ssh_ok && break; sleep 1; done
+if local_ssh_ok; then ok "ssh enabled and answering on port $SSH_PORT on this VM"
+else warn "ssh on this VM is not answering on port $SSH_PORT - check: systemctl status ssh"; fi
 if [[ "$(hostname)" != "$CLIENT_HOSTNAME" ]]; then
   hostnamectl set-hostname "$CLIENT_HOSTNAME"; ok "hostname set to $CLIENT_HOSTNAME"
 else ok "hostname already $CLIENT_HOSTNAME"; fi
@@ -352,32 +413,56 @@ if [[ -s "$TMPC" && -n "$(tail -c1 "$TMPC")" ]]; then echo >> "$TMPC"; fi   # en
 if [[ -s "$TMPC" ]] && [[ -n "$(tail -n1 "$TMPC")" ]]; then echo >> "$TMPC"; fi # blank line between hosts
 printf 'Host server\n    HostName %s\n    User %s\n    IdentityFile ~/.ssh/%s\n' \
   "$SERVER_FQDN" "$SERVER_USER" "$KEY_NAME" >> "$TMPC"
+[[ "$SSH_PORT" == 22 ]] || printf '    Port %s\n' "$SSH_PORT" >> "$TMPC"
 if cmp -s "$TMPC" "$CFG"; then ok "~/.ssh/config already has the Host server entry"
 else cp -a "$CFG" "$CFG.cet245-bak" 2>/dev/null || true; cat "$TMPC" > "$CFG"; ok "~/.ssh/config: Host server -> $SERVER_USER@$SERVER_FQDN, IdentityFile ~/.ssh/$KEY_NAME"; fi
 rm -f "$TMPC"
 chown "$DUSER:$(id -gn "$DUSER")" "$CFG"; chmod 600 "$CFG"
+
+say "Lab 6 - is the server's SSH reachable on port $SSH_PORT?"
+SSH_UP=1
+ssh_server_reachable || SSH_UP=0
+
 # A rebuilt server has new host keys; drop the old ones so ssh doesn't refuse.
-for h in "$SERVER_FQDN" "$DOMAIN" "$SERVER_IP"; do
-  as_user ssh-keygen -R "$h" >/dev/null 2>&1 || true
-done
-if as_user bash -c "ssh-keyscan -T 5 '$SERVER_FQDN' '$DOMAIN' '$SERVER_IP' 2>/dev/null >> ~/.ssh/known_hosts"; then
-  ok "server host keys refreshed in ~/.ssh/known_hosts"
+if [[ $SSH_UP -eq 1 ]]; then
+  for h in "$SERVER_FQDN" "$DOMAIN" "$SERVER_IP"; do
+    if [[ "$SSH_PORT" == 22 ]]; then as_user ssh-keygen -R "$h" >/dev/null 2>&1 || true
+    else as_user ssh-keygen -R "[$h]:$SSH_PORT" >/dev/null 2>&1 || true; fi
+  done
+  if as_user bash -c "ssh-keyscan -T 5 -p '$SSH_PORT' '$SERVER_FQDN' '$DOMAIN' '$SERVER_IP' 2>/dev/null >> ~/.ssh/known_hosts"; then
+    ok "server host keys refreshed in ~/.ssh/known_hosts"
+  fi
+fi
+
+say "Lab 6 - log in to $SERVER_USER@$SERVER_IP with the password (step 2)"
+if [[ $SSH_UP -eq 0 ]]; then warn "skipped - the server's SSH is not reachable (see above)"
+elif password_login_ok; then ok "password login works"
+else
+  rc=$?
+  if [[ $rc -eq 2 ]]; then warn "sshpass not installed - can't test the password login automatically"
+  else warn "password login failed - on the server: PasswordAuthentication yes (Lab 6 step 1), and $SERVER_USER's password is $LAB_PASSWORD"; fi
 fi
 
 say "Lab 6 - copy the key to $SERVER_USER@$SERVER_FQDN (step 9)"
-if key_login_ok; then
+if [[ $SSH_UP -eq 0 ]]; then
+  warn "skipped - the server's SSH is not reachable (see above)"
+elif key_login_ok; then
   ok "key login already works"
 elif command -v sshpass >/dev/null && as_user env SSHPASS="$LAB_PASSWORD" sshpass -e \
-       ssh-copy-id -i "$KEY.pub" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_FQDN" >>"$LOG" 2>&1; then
+       ssh-copy-id -i "$KEY.pub" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_FQDN" >>"$LOG" 2>&1; then
   ok "key copied with ssh-copy-id"
 else
   warn "could not copy the key automatically. Run this yourself (password $LAB_PASSWORD):"
   warn "    ssh-copy-id -i ~/.ssh/$KEY_NAME.pub $SERVER_USER@$SERVER_FQDN"
 fi
+if [[ $SSH_UP -eq 1 ]]; then
+  if alias_login_ok; then ok "ssh server works (Host server alias with the key, step 10)"
+  else warn "ssh server (the ~/.ssh/config alias) does not log in yet - try: ssh server -v"; fi
+fi
 
 if key_login_ok; then
   say "Lab 6 - copy for-transfer.txt from the server (steps 7-8)"
-  if as_user scp -q "${SSH_OPTS[@]}" -i "$KEY" "$SERVER_USER@$SERVER_FQDN:~/for-transfer.txt" "$DHOME/" 2>>"$LOG" \
+  if as_user scp -q -P "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i "$KEY" "$SERVER_USER@$SERVER_FQDN:~/for-transfer.txt" "$DHOME/" 2>>"$LOG" \
      && as_user mkdir -p "$DHOME/Downloads" \
      && as_user cp "$DHOME/for-transfer.txt" "$DHOME/Downloads/"; then
     ok "for-transfer.txt copied to ~ and ~/Downloads"

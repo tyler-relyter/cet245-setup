@@ -45,6 +45,7 @@ REVERSE_ZONE="2.0.10.in-addr.arpa"      # reverse of 10.0.2.x
 GATEWAY="auto"      # "auto" = keep the gateway DHCP gave this VM. Lab 3 says 10.0.2.2.
 UPSTREAM_DNS=("1.1.1.1" "1.0.0.1" "8.8.8.8")
 LAB_PASSWORD="Password01"                # course lab password - lab VMs only
+SSH_PORT="22"                            # Labs 2/3/6 use the standard port (nftables "tcp dport 22", ufw allow ssh)
 IFACE="auto"        # "auto" = interface that holds the default route (enp0s3 on VirtualBox, ens18 on Proxmox)
 STUDENT_USER="student"                   # the lab account from Lab 1 (--user to change)
 STUDENT_NAME=""                          # --name; default comes from the account's full name
@@ -96,7 +97,7 @@ pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'insta
 backup() {
   [[ -e "$1" ]] || return 0
   mkdir -p "$BACKUP_DIR$(dirname "$1")"
-  cp -a "$1" "$BACKUP_DIR$1"
+  [[ -e "$BACKUP_DIR$1" ]] || cp -a "$1" "$BACKUP_DIR$1"   # keep the copy from before this run
 }
 # Keep the lab-named "conserved original" (named.conf.orig, nginx.conf.bak ...) once.
 keep_original() { if [[ -e "$1" && ! -e "$2" ]]; then cp -a "$1" "$2"; ok "kept original as $2"; fi; }
@@ -288,6 +289,191 @@ preflight_network() {
   else warn "names still do not resolve, even through ${FALLBACK_DNS[*]} - apt will fail; see the report above"; fi
 }
 
+# ============================ SSH (Labs 2, 3, 6) =============================
+# Lab 2 installs ssh and runs "systemctl enable --now ssh"; Lab 3 opens
+# "tcp dport 22" in nftables and turns on fail2ban; Lab 6 sets the sshd options
+# and "ufw allow ssh". These helpers make sure sshd is installed, valid, running
+# and really answering on $SSH_PORT, and that the firewalls let it through.
+# Ubuntu 22.10+ starts sshd through ssh.socket (socket activation), where the
+# port comes from sshd_config only after "systemctl daemon-reload".
+
+# set_sshd KEY VALUE : set one sshd_config option. Replaces the first line for
+# KEY (commented or not), comments out later active duplicates, and if KEY is
+# missing adds it before any Match block. Lines inside Match blocks are left alone.
+set_sshd() {
+  local k="$1" v="$2" f=/etc/ssh/sshd_config tmp
+  tmp=$(mktemp)
+  awk -v k="$k" -v v="$v" '
+    BEGIN { lk = tolower(k); done = 0; inmatch = 0 }
+    {
+      line = tolower($0)
+      if (line ~ /^[ \t]*match[ \t]/) {            # global options end here
+        if (!done) { print k " " v; done = 1 }
+        inmatch = 1
+      }
+      if (!inmatch && match(line, "^[ \t]*#?[ \t]*" lk "[ \t]")) {
+        if (!done) { print k " " v; done = 1; next }
+        if (line !~ /^[ \t]*#/) { print "#" $0; next }
+      }
+      print
+    }
+    END { if (!done) print k " " v }' "$f" > "$tmp"
+  cat "$tmp" > "$f"; rm -f "$tmp"
+}
+# unset_sshd_dropins KEY... : comment KEY lines in sshd_config.d (read first, so they win)
+unset_sshd_dropins() {
+  local f re; re=$(IFS='|'; echo "$*")
+  for f in /etc/ssh/sshd_config.d/*.conf; do
+    [[ -e "$f" ]] || continue
+    grep -qiE "^[[:space:]]*($re)[[:space:]]" "$f" || continue
+    backup "$f"
+    sed -i -E "s/^([[:space:]]*)($re)([[:space:]])/#\1\2\3/I" "$f"
+    ok "commented overriding $(echo "$*" | tr ' ' '/') lines in $f"
+  done
+}
+
+ssh_port_cfg()  { sshd -T 2>/dev/null | awk '$1 == "port" { print $2; exit }' || true; }
+ssh_listening() { ss -Htln "sport = :${1:-$SSH_PORT}" 2>/dev/null | grep -q .; }
+ssh_mode()      { if systemctl is-active --quiet ssh.socket 2>/dev/null; then echo "via ssh.socket"; else echo "via ssh.service"; fi; }
+# ssh_banner HOST [PORT] : the port answers the way an SSH server does ("SSH-2.0-...")
+ssh_banner() {
+  timeout 6 bash -c 'exec 3<>"/dev/tcp/$1/$2" && IFS= read -r -t 5 l <&3 && [[ $l == SSH-2.0-* ]]' \
+    _ "$1" "${2:-$SSH_PORT}" 2>/dev/null
+}
+# ssh_auth_methods HOST : login methods the server offers, e.g. "publickey,password".
+# Every method is switched off on our side, so no password is tried (nothing for fail2ban).
+ssh_auth_methods() {
+  ssh -p "$SSH_PORT" -o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o PubkeyAuthentication=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+      -o GSSAPIAuthentication=no -o HostbasedAuthentication=no \
+      "$STUDENT_USER@$1" true 2>&1 | sed -n 's/.*Permission denied (\([^)]*\)).*/\1/p' | head -1 || true
+}
+ssh_offers_password_and_key() { local m; m=$(ssh_auth_methods 127.0.0.1); [[ "$m" == *publickey* && "$m" == *password* ]]; }
+nft_allows_ssh() { nft list ruleset 2>/dev/null | grep -qE "tcp dport (\{[^}]*\b)?$SSH_PORT\b[^}]*\}? accept|tcp dport $SSH_PORT accept"; }
+ufw_allows_ssh() { ufw status 2>/dev/null | grep -qE "^(OpenSSH|$SSH_PORT(/tcp)?)[[:space:]]+ALLOW"; }
+f2b_lab_banned() {   # lab-network addresses fail2ban's sshd jail has banned, one per line
+  fail2ban-client status sshd 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p' \
+    | tr ' \t' '\n\n' | grep -F "${NETWORK_CIDR%.*/*}." || true
+}
+f2b_lab_ok() { ! systemctl is-active --quiet fail2ban 2>/dev/null || [[ -z "$(f2b_lab_banned)" ]]; }
+
+# ssh_config_ok_or_repair : sshd -t must pass. Fixes the usual causes: missing
+# host keys (cloned VM), missing /run/sshd, a broken file in sshd_config.d, and
+# as a last resort replaces sshd_config with Ubuntu's packaged default.
+ssh_config_ok_or_repair() {
+  local err f n
+  mkdir -p /run/sshd; chmod 755 /run/sshd
+  if ! compgen -G '/etc/ssh/ssh_host_*_key' >/dev/null; then
+    ssh-keygen -A >>"$LOG" 2>&1; ok "SSH host keys were missing - generated new ones (ssh-keygen -A)"
+  fi
+  for _ in 1 2 3 4 5; do
+    if err=$(sshd -t 2>&1); then ok "sshd -t passed"; return 0; fi
+    warn "sshd -t: $(printf '%s\n' "$err" | head -1)"
+    f=$(printf '%s\n' "$err" | grep -oE '/etc/ssh/sshd_config(\.d/[^: ]+)?' | head -1 || true)
+    if printf '%s' "$err" | grep -qiE 'host key|no hostkeys'; then
+      ssh-keygen -A >>"$LOG" 2>&1; ok "regenerated SSH host keys"
+    elif n=$(printf '%s\n' "$err" | sed -n 's/^[^:]*: line \([0-9][0-9]*\): Bad configuration option.*/\1/p' | head -1) \
+         && [[ -n "$n" && -f "$f" ]]; then
+      backup "$f"; sed -i "${n}s/^/# CET245 invalid: /" "$f"
+      warn "commented out line $n of $f (unknown option)"
+    elif [[ "$f" == /etc/ssh/sshd_config.d/* && -f "$f" ]]; then
+      backup "$f"; rm -f "$f"; warn "set aside $f - it broke sshd -t (copy in $BACKUP_DIR)"
+    elif [[ -f /usr/share/openssh/sshd_config ]]; then
+      backup /etc/ssh/sshd_config
+      cp /usr/share/openssh/sshd_config /etc/ssh/sshd_config
+      warn "sshd_config was invalid - replaced with Ubuntu's default (old copy in $BACKUP_DIR)"
+      if done_or_wanted 6; then ssh_lab6_options; fi
+    else
+      break
+    fi
+  done
+  sshd -t || true
+  die "sshd configuration is still invalid - see the sshd -t message above"
+}
+
+# ssh_lab6_options : the four Lab 6 options (steps 1 and 3)
+ssh_lab6_options() {
+  set_sshd PasswordAuthentication yes
+  set_sshd PermitRootLogin no
+  set_sshd StrictModes yes
+  set_sshd PubkeyAuthentication yes
+  # cloud-init often drops "PasswordAuthentication no" into sshd_config.d
+  unset_sshd_dropins PasswordAuthentication PermitRootLogin StrictModes PubkeyAuthentication
+}
+
+# ssh_port_enforce : the labs' firewall rules open $SSH_PORT, so sshd must use it
+ssh_port_enforce() {
+  local p; p=$(ssh_port_cfg)
+  if [[ "$p" == "$SSH_PORT" ]]; then ok "sshd configured for port $SSH_PORT (sshd -T)"; return 0; fi
+  backup /etc/ssh/sshd_config
+  set_sshd Port "$SSH_PORT"
+  unset_sshd_dropins Port
+  warn "sshd was set to port ${p:-?}; reset to $SSH_PORT, the port the Lab 3 and Lab 6 firewall rules open"
+  if compgen -G '/etc/systemd/system/ssh.socket.d/*.conf' >/dev/null \
+     && grep -qhE '^[[:space:]]*ListenStream=' /etc/systemd/system/ssh.socket.d/*.conf; then
+    warn "a custom ssh.socket override in /etc/systemd/system/ssh.socket.d sets ListenStream - check it if SSH stays on another port"
+  fi
+}
+
+# ssh_start : enable at boot, (re)start, then prove the port answers
+ssh_start() {
+  systemctl daemon-reload                          # ssh.socket picks up Port from sshd_config
+  systemctl enable ssh >>"$LOG" 2>&1 || true       # Lab 2 step 13: systemctl enable --now ssh
+  systemctl restart ssh >>"$LOG" 2>&1 || systemctl start ssh >>"$LOG" 2>&1 || true
+  # The socket keeps its old port until it is restarted; only restart it when
+  # it isn't on $SSH_PORT (open SSH sessions survive either restart).
+  if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    ssh_listening || systemctl restart ssh.socket >>"$LOG" 2>&1 || true
+    systemctl is-active --quiet ssh.socket || systemctl start ssh.socket >>"$LOG" 2>&1 || true
+  fi
+  local _; for _ in 1 2 3 4 5; do ssh_listening && break; sleep 1; done
+  if ! ssh_listening; then
+    warn "nothing is listening on TCP $SSH_PORT"
+    systemctl status ssh --no-pager -n 8 2>&1 | sed 's/^/        /' | tee -a "$LOG" || true
+    die "SSH did not start - see the status above"
+  fi
+  ok "ssh enabled at boot and listening on TCP $SSH_PORT ($(ssh_mode))"
+  if ssh_banner 127.0.0.1; then ok "port $SSH_PORT answers as SSH on 127.0.0.1"
+  else die "port $SSH_PORT is open but does not answer like SSH"; fi
+  if ip -4 addr show 2>/dev/null | grep -q "inet $SERVER_IP/"; then
+    if ssh_banner "$SERVER_IP"; then ok "port $SSH_PORT answers as SSH on $SERVER_IP (the address the client uses)"
+    else warn "port $SSH_PORT does not answer on $SERVER_IP - check ListenAddress in sshd_config"; fi
+  fi
+}
+
+# ssh_ensure : the whole SSH bring-up, used by Lab 2 and Lab 6
+ssh_ensure() {
+  pkg_installed openssh-server || { apt-get install -y -q openssh-server ssh >>"$LOG" 2>&1; ok "installed openssh-server"; }
+  ssh_config_ok_or_repair
+  ssh_port_enforce
+  sshd -t || die "sshd -t failed after setting the port"
+  ssh_start
+}
+
+# ssh_firewall_ensure : the firewalls the labs turn on must let SSH through,
+# and fail2ban must not be holding a lab VM's address (a student who mistyped
+# the password five times bans the client for 10 minutes on Ubuntu's defaults).
+ssh_firewall_ensure() {
+  local ip
+  if systemctl is-active --quiet nftables 2>/dev/null && nft list chain inet filter input >/dev/null 2>&1; then
+    if nft_allows_ssh; then ok "nftables allows tcp dport $SSH_PORT (Lab 3)"
+    else
+      nft add rule inet filter input tcp dport "$SSH_PORT" accept comment '"Allow SSH TCP"' >>"$LOG" 2>&1 \
+        && warn "nftables had no tcp dport $SSH_PORT rule - added it for now; re-run with --labs 3 to rewrite /etc/nftables.conf"
+    fi
+  fi
+  if ufw status 2>/dev/null | grep -q 'Status: active'; then
+    if ufw_allows_ssh; then ok "ufw allows OpenSSH (Lab 6)"
+    else ufw allow OpenSSH >>"$LOG" 2>&1 || ufw allow "$SSH_PORT/tcp" >>"$LOG" 2>&1; ok "ufw was blocking SSH - allowed OpenSSH"; fi
+  fi
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    for ip in $(f2b_lab_banned); do
+      fail2ban-client set sshd unbanip "$ip" >>"$LOG" 2>&1 && warn "fail2ban had banned $ip from SSH (too many wrong passwords) - unbanned it"
+    done
+  fi
+}
+
 # ============================== verification =================================
 check() {   # check "description" command...
   local d="$1"; shift
@@ -308,12 +494,21 @@ verify() {
   if done_or_wanted 5; then check "lab names resolve (getent server.$DOMAIN)" names_ok "server.$DOMAIN"; fi
   names_ok || dns_report
   want 2 && { check "hostname is $SERVER_HOSTNAME" test "$(hostname)" = "$SERVER_HOSTNAME"
-              check "ssh service active" bash -c "systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket"; }
+              check "openssh-server installed" pkg_installed openssh-server
+              check "ssh starts at boot (ssh.service or ssh.socket enabled)" bash -c "systemctl is-enabled --quiet ssh || systemctl is-enabled --quiet ssh.socket"
+              check "ssh running (ssh.service or ssh.socket active)" bash -c "systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket"
+              check "sshd configured for port $SSH_PORT (sshd -T)" test "$(ssh_port_cfg)" = "$SSH_PORT"
+              check "listening on TCP $SSH_PORT (ss -tln)" ssh_listening
+              check "port $SSH_PORT answers as SSH on 127.0.0.1" ssh_banner 127.0.0.1
+              if ip -4 addr show 2>/dev/null | grep -q "inet $SERVER_IP/"; then
+                check "port $SSH_PORT answers as SSH on $SERVER_IP" ssh_banner "$SERVER_IP"; fi
+              check "fail2ban is not banning a lab address from SSH" f2b_lab_ok; }
   want 3 && { check "$IFACE has $SERVER_IP/$PREFIX" bash -c "ip -4 addr show $IFACE | grep -q '$SERVER_IP/$PREFIX'"
               check "internet reachable (ping 8.8.8.8)" ping -c 2 -W 2 8.8.8.8
               done_or_wanted 6 || check "ufw disabled (Lab 3; Lab 6 turns it back on)" bash -c "! systemctl is-active --quiet ufw"
               check "nftables active" systemctl is-active --quiet nftables
               check "nftables has the trusted set" bash -c "nft list ruleset | grep -q 'set trusted'"
+              check "nftables allows tcp dport $SSH_PORT" nft_allows_ssh
               check "fail2ban installed" dpkg -s fail2ban; }
   want 4 && { check "users instructor and lecturer exist" bash -c "id instructor && id lecturer"
               check "both are in faculty" bash -c "id -nG instructor | grep -qw faculty && id -nG lecturer | grep -qw faculty"
@@ -328,11 +523,13 @@ verify() {
               check "dig -x $SERVER_IP -> server.$DOMAIN." bash -c "dig +short @127.0.0.1 -x $SERVER_IP | grep -qx 'server.$DOMAIN.'"
               check "recursion works (dig ubuntu.com)" bash -c "dig +short @127.0.0.1 ubuntu.com | grep -q ."; }
   want 6 && { check "sshd config valid (sshd -t)" sshd -t
+              check "sshd offers publickey and password logins" ssh_offers_password_and_key
               check "sshd: PasswordAuthentication yes" bash -c "sshd -T 2>/dev/null | grep -qx 'passwordauthentication yes'"
               check "sshd: PermitRootLogin no" bash -c "sshd -T 2>/dev/null | grep -qx 'permitrootlogin no'"
               check "sshd: StrictModes yes" bash -c "sshd -T 2>/dev/null | grep -qx 'strictmodes yes'"
               check "sshd: PubkeyAuthentication yes" bash -c "sshd -T 2>/dev/null | grep -qx 'pubkeyauthentication yes'"
-              check "ufw active and allowing SSH" bash -c "ufw status | grep -q 'Status: active' && ufw status | grep -qE '^(OpenSSH|22)'"
+              check "ufw active" bash -c "ufw status | grep -q 'Status: active'"
+              check "ufw allows OpenSSH/$SSH_PORT" ufw_allows_ssh
               check "user $STUDENT_USER exists" id "$STUDENT_USER"
               check "$STUDENT_USER ~/.ssh/config has Host server" grep -q '^Host server' "$sh/.ssh/config"
               check "$STUDENT_USER ~/for-transfer.txt exists" test -s "$sh/for-transfer.txt"
@@ -424,7 +621,7 @@ if want 2; then
     echo "127.0.1.1 $SERVER_HOSTNAME.$DOMAIN $SERVER_HOSTNAME" >> /etc/hosts
     ok "/etc/hosts: 127.0.1.1 $SERVER_HOSTNAME.$DOMAIN"; }
   echo "root:$LAB_PASSWORD" | chpasswd && ok "root password set (Lab 2 step 3)"
-  systemctl enable --now ssh >>"$LOG" 2>&1 && ok "ssh enabled and running"
+  ssh_ensure                            # step 13: systemctl enable --now ssh, then prove it answers
   mark_done 2
 fi
 
@@ -458,7 +655,7 @@ table inet filter {
 		iif "lo" accept # Allow loopback traffic
 		udp dport 53 accept # Allow DNS UDP
 		tcp dport 53 accept # Allow DNS TCP
-		tcp dport 22 accept # Allow SSH TCP
+		tcp dport $SSH_PORT accept # Allow SSH TCP
 	}
 
 	chain forward {
@@ -477,6 +674,7 @@ EOF
   # "flush ruleset" also clears UFW's tables; put them back if UFW is on.
   if systemctl is-active --quiet ufw; then ufw reload >>"$LOG" 2>&1 && ok "ufw rules reloaded on top of nftables"; fi
   systemctl enable --now fail2ban >>"$LOG" 2>&1 && ok "fail2ban installed and running (defaults; jail.conf untouched)"
+  ssh_firewall_ensure
 
   say "Lab 3 - static IP $SERVER_IP/$PREFIX on $IFACE"
   NP=/etc/netplan/50-cloud-init.yaml
@@ -700,29 +898,6 @@ EOF
 fi
 
 # ================================ LAB 6 ======================================
-# set_sshd KEY VALUE : set one sshd_config option. Replaces the first line for
-# KEY (commented or not), comments out later active duplicates, and if KEY is
-# missing adds it before any Match block. Lines inside Match blocks are left alone.
-set_sshd() {
-  local k="$1" v="$2" f=/etc/ssh/sshd_config tmp
-  tmp=$(mktemp)
-  awk -v k="$k" -v v="$v" '
-    BEGIN { lk = tolower(k); done = 0; inmatch = 0 }
-    {
-      line = tolower($0)
-      if (line ~ /^[ \t]*match[ \t]/) {            # global options end here
-        if (!done) { print k " " v; done = 1 }
-        inmatch = 1
-      }
-      if (!inmatch && match(line, "^[ \t]*#?[ \t]*" lk "[ \t]")) {
-        if (!done) { print k " " v; done = 1; next }
-        if (line !~ /^[ \t]*#/) { print "#" $0; next }
-      }
-      print
-    }
-    END { if (!done) print k " " v }' "$f" > "$tmp"
-  cat "$tmp" > "$f"; rm -f "$tmp"
-}
 if want 6; then
   say "Lab 6 - SSH server options and UFW"
   if ! id "$STUDENT_USER" &>/dev/null; then
@@ -732,24 +907,13 @@ if want 6; then
   fi
   SH=$(student_home)
   backup /etc/ssh/sshd_config
-  set_sshd PasswordAuthentication yes   # step 1
-  set_sshd PermitRootLogin no           # step 3
-  set_sshd StrictModes yes
-  set_sshd PubkeyAuthentication yes
-  # Files in sshd_config.d are read first and win; comment out any that
-  # override these four (cloud-init often sets PasswordAuthentication no).
-  for f in /etc/ssh/sshd_config.d/*.conf; do
-    [[ -e "$f" ]] || continue
-    if grep -qiE '^[[:space:]]*(PasswordAuthentication|PermitRootLogin|StrictModes|PubkeyAuthentication)[[:space:]]' "$f"; then
-      backup "$f"
-      sed -i -E 's/^([[:space:]]*)(PasswordAuthentication|PermitRootLogin|StrictModes|PubkeyAuthentication)([[:space:]])/#\1\2\3/I' "$f"
-      ok "commented overriding options in $f"
-    fi
-  done
+  for f in /etc/ssh/sshd_config.d/*.conf; do [[ -e "$f" ]] && backup "$f"; done
+  ssh_lab6_options                      # steps 1 and 3
   sshd -t || die "sshd_config failed sshd -t - the old copy is in $BACKUP_DIR/etc/ssh"
   ok "sshd_config: PasswordAuthentication yes, PermitRootLogin no, StrictModes yes, PubkeyAuthentication yes"
-  systemctl restart ssh >>"$LOG" 2>&1 || systemctl restart ssh.socket >>"$LOG" 2>&1 || true
-  ok "ssh restarted (open sessions stay connected)"
+  ssh_ensure                            # restart (open sessions stay connected) and re-test port $SSH_PORT
+  if ssh_offers_password_and_key; then ok "sshd offers publickey and password logins (what the client steps use)"
+  else warn "sshd does not offer both publickey and password logins: '$(ssh_auth_methods 127.0.0.1)'"; fi
 
   # UFW and the Lab 3 nftables rules both filter traffic: a packet must pass
   # both. So besides SSH (the lab step), UFW also allows the trusted lab
@@ -768,6 +932,8 @@ EOF
   ufw --force enable >>"$LOG" 2>&1
   systemctl enable ufw >>"$LOG" 2>&1 || true
   ok "ufw enabled: OpenSSH, $NETWORK_CIDR, DNS 53"
+  ssh_firewall_ensure
+  ssh_banner "$SERVER_IP" && ok "SSH still answers on $SERVER_IP:$SSH_PORT with ufw on" || true
 
   say "Lab 6 - $STUDENT_USER's SSH client config and transfer file"
   install -d -m 700 -o "$STUDENT_USER" -g "$STUDENT_USER" "$SH/.ssh"
